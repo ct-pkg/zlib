@@ -1,0 +1,82 @@
+/*
+ * zlib.m.ct - the zero-cost surface of the zlib package.
+ *
+ * Two type hosts, no namespace entries:
+ *
+ *   z_stream *  the state machine (`zp->deflateInit(6)`, `zp->deflate(Z_FINISH)`)
+ *   char *      one-shot text helpers (`text.deflate(out, cap)`)
+ *
+ * Each method expands at the call site into the plain C call, so there is no
+ * wrapper, no interface value and no vtable. The same method name may live on
+ * both hosts (`deflate`): they are different type keys, so a call site resolves
+ * by the receiver type, never ambiguously.
+ *
+ * The init methods are the exception: upstream `deflateInit` / `inflateInit`
+ * are macros that pass `ZLIB_VERSION` and `sizeof(z_stream)` to the real
+ * `deflateInit_` / `inflateInit_`. A map recipe can name only its binding
+ * parameters, so it cannot spell `sizeof(z_stream)`; the shims in zlib.shim.h
+ * do the expansion instead.
+ *
+ * `z_stream` is a plain header struct. The host is the POINTER type, and the
+ * receiver has to be a pointer variable: a by-value `z_stream` is not
+ * auto-addressed (`zp = &zs; zp->deflate(...)`, not `zs.deflate(...)`).
+ *
+ * The `char *` host is for whole-buffer text. Its input length is `strlen`, so
+ * it cannot carry NUL bytes; `inflate` takes an explicit `inLen` because the
+ * compressed input is binary. For binary input or multi-round streaming use the
+ * `z_stream *` host.
+ *
+ * License: Zlib (see LICENSE).
+ */
+#include <zlib.h>
+
+namespace zlib;
+
+/* State machine: the object is the z_stream itself. */
+pub trait Init {
+    int deflateInit(int level);
+    int inflateInit();
+}
+
+pub trait Codec {
+    int deflate(int flush);
+    int deflateEnd();
+    int inflate(int flush);
+    int inflateEnd();
+}
+
+/* One call that installs the four buffer fields, then runs one step. */
+pub trait Buffer {
+    int deflateBuffer(const char *in, int inLen, char *out, int outCap, int flush);
+    int inflateBuffer(const char *in, int inLen, char *out, int outCap, int flush);
+}
+
+/* Whole-buffer text helpers: input length comes from strlen. */
+pub trait Text {
+    int deflate(char *out, int cap);
+    int inflate(int inLen, char *out, int cap);
+    int deflateBound();
+}
+
+map trait Init for type z_stream * {
+    deflateInit(z, level) -> ct_zlib_deflate_init(z, level);
+    inflateInit(z)        -> ct_zlib_inflate_init(z);
+}
+
+map trait Codec for type z_stream * {
+    deflate(z, flush)     -> deflate(z, flush);
+    deflateEnd(z)         -> deflateEnd(z);
+    inflate(z, flush)     -> inflate(z, flush);
+    inflateEnd(z)         -> inflateEnd(z);
+}
+
+map trait Buffer for type z_stream * {
+    deflateBuffer(z, in, inLen, out, outCap, flush) -> ct_zlib_deflate_buffer(z, in, inLen, out, outCap, flush);
+    inflateBuffer(z, in, inLen, out, outCap, flush) -> ct_zlib_inflate_buffer(z, in, inLen, out, outCap, flush);
+}
+
+map trait Text for type char * {
+    deflate(s, out, cap)        -> ct_zlib_deflate_text(s, out, cap);
+    inflate(s, inLen, out, cap) -> ct_zlib_inflate_text(s, inLen, out, cap);
+    deflateBound(s)             -> ct_zlib_deflate_bound(s);
+}

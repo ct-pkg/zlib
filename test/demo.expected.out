@@ -1,0 +1,15 @@
+in=17
+deflate=1
+packed=16
+deflate_end=0
+inflate=1
+out=17
+roundtrip=ok
+text_deflate=16
+text_bound_ok=1
+text_inflate=17
+text_roundtrip=ok
+buffer_deflate=1
+buffer_inflate=1
+buffer_out=17
+buffer_roundtrip=ok

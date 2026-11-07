@@ -1,0 +1,19 @@
+# zlib - the zlib (deflate/inflate) mapping package (Phase 2).
+#
+# The whole surface is one .m.ct unit under namespace zlib, hung on two type
+# hosts: `z_stream *` (state machine and buffer helpers) and `char *` (one-shot
+# text helpers). Every method expands at the call site into the plain C call
+# (no wrapper, no vtable). The two macro initialisers live in zlib.shim.h,
+# because a recipe cannot spell
+# `deflateInit_(&s, level, ZLIB_VERSION, sizeof(z_stream))`.
+#
+# `-lz` rides in `ldflags`, so `ct install` puts it on the command it prints.
+# The package links the system zlib; it vendors no upstream source.
+#
+# `requires` is 0.19.1: the type-host spelling used here (`for type z_stream *`)
+# is verified on that compiler; 0.17 / 0.18 were never regression-tested.
+name = zlib
+version = 0.1.0
+licence = Zlib
+ldflags = -lz
+requires = ct >= 0.19.1

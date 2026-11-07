@@ -1,0 +1,558 @@
+/*
+ * unit.ct - the zlib package unit suite.
+ *
+ * One program, named cases, `SUMMARY pass=N fail=M`, non-zero exit on failure.
+ * Every round trip compares both the length and the bytes; a return code alone
+ * never counts as a pass.
+ *
+ * Hosts covered:
+ *   char *      Text:      deflate / inflate / deflateBound
+ *   z_stream *  Buffer:    deflateBuffer / inflateBuffer
+ *   z_stream *  Init+Codec: deflateInit / deflate / deflateEnd /
+ *                           inflateInit / inflate / inflateEnd
+ *
+ * Output buffers carry a 0xA5 canary past the declared capacity, so a write
+ * past the cap fails the case even when the status code looks right.
+ *
+ * Fixtures are static buffers; no files are read or written. `Text` input
+ * length is `strlen`, so binary data with NUL bytes goes through `Buffer`.
+ *
+ * License: Zlib (see LICENSE).
+ */
+#include <stdio.h>
+#include <string.h>
+#include <zlib.h>
+
+import zlib::zlib;
+
+#define BIG 100000
+#define CANARY 0xA5
+
+static int g_pass;
+static int g_fail;
+
+static char big_text[BIG + 1];
+static char big_packed[BIG + 200];
+static char big_back[BIG + 1];
+
+static char bin[BIG];
+static char bin_packed[BIG + 200];
+static char bin_back[BIG];
+
+static char rnd[4096];
+static char rnd_packed[8192];
+static char rnd_back[4096];
+
+static void pass1(char *name)
+{
+    g_pass = g_pass + 1;
+    printf("  ok    %s\n", name);
+}
+
+static void fail1(char *name)
+{
+    g_fail = g_fail + 1;
+    printf("  FAIL  %s\n", name);
+}
+
+static int want(char *name, int got, int expected)
+{
+    if (got == expected) {
+        pass1(name);
+        return 1;
+    }
+    printf("  FAIL  %s: got %d want %d\n", name, got, expected);
+    g_fail = g_fail + 1;
+    return 0;
+}
+
+static int truth(char *name, int cond)
+{
+    if (cond) {
+        pass1(name);
+        return 1;
+    }
+    printf("  FAIL  %s: condition false\n", name);
+    g_fail = g_fail + 1;
+    return 0;
+}
+
+static void paint(char *buf, int n)
+{
+    memset(buf, CANARY, (size_t)n);
+}
+
+static int canary(char *buf, int from, int to)
+{
+    int i;
+
+    for (i = from; i < to; i++) {
+        if ((unsigned char)buf[i] != CANARY) return 0;
+    }
+    return 1;
+}
+
+/* ---------------------------------------------------------------- Text --- */
+
+static void test_text_basic(void)
+{
+    char packed[64];
+    char back[16];
+    char *s;
+    char *in;
+    char *bigp;
+    int n;
+    int m;
+
+    /* Empty input still produces a valid empty stream. */
+    s = "";
+    paint(packed, 64);
+    n = s.deflate(packed, 64);
+    truth("Text/deflate/empty", n >= 0 && n <= 64);
+    if (n >= 0) {
+        in = packed;
+        paint(back, 16);
+        m = in.inflate(n, back, 16);
+        want("Text/inflate/empty", m, 0);
+    } else {
+        fail1("Text/inflate/empty");
+    }
+
+    /* One byte. */
+    s = "a";
+    paint(packed, 64);
+    n = s.deflate(packed, 64);
+    truth("Text/deflate/single", n > 0 && n <= 64);
+    if (n > 0) {
+        in = packed;
+        paint(back, 16);
+        m = in.inflate(n, back, 16);
+        want("Text/inflate/single-length", m, 1);
+        truth("Text/inflate/single-byte", m == 1 && back[0] == 'a');
+    } else {
+        fail1("Text/inflate/single-length");
+        fail1("Text/inflate/single-byte");
+    }
+
+    /* > 64 KB: compressible, round trip must be byte-exact. */
+    memset(big_text, 'A', BIG);
+    big_text[BIG] = 0;
+    bigp = big_text;
+    paint(&big_packed[0], BIG + 200);
+    n = bigp.deflate(big_packed, BIG + 200);
+    truth("Text/deflate/large-100k", n > 0 && n < BIG);
+    if (n > 0) {
+        in = big_packed;
+        paint(&big_back[0], BIG + 1);
+        m = in.inflate(n, big_back, BIG + 1);
+        want("Text/roundtrip/large-length", m, BIG);
+        truth("Text/roundtrip/large-bytes",
+              m == BIG && memcmp(big_back, big_text, (size_t)BIG) == 0);
+        truth("Text/inflate/larger-than-compressed", m > n);
+    } else {
+        fail1("Text/roundtrip/large-length");
+        fail1("Text/roundtrip/large-bytes");
+        fail1("Text/inflate/larger-than-compressed");
+    }
+
+    /* Text is strlen-based: bytes after the first NUL are not carried. */
+    s = "ab\0cd";
+    paint(packed, 64);
+    n = s.deflate(packed, 64);
+    in = packed;
+    paint(back, 16);
+    m = n > 0 ? in.inflate(n, back, 16) : -1;
+    truth("Text/strlen/stops-at-nul",
+          n > 0 && m == 2 && back[0] == 'a' && back[1] == 'b');
+}
+
+static void test_text_edges(void)
+{
+    char packed[64];
+    char alt[64];
+    char back[64];
+    char corrupt[64];
+    char *s;
+    char *in;
+    int n;
+    int r;
+
+    s = "hello hello hello";
+    paint(packed, 64);
+    n = s.deflate(packed, 64);
+    if (!truth("Text/deflate/known-input", n > 0)) return;
+
+    /* Output buffer exactly the compressed size. */
+    paint(alt, 64);
+    r = s.deflate(alt, n);
+    want("Text/deflate/exact-cap", r, n);
+    truth("Text/deflate/exact-bytes", memcmp(alt, packed, (size_t)n) == 0);
+
+    /* One byte short: mapped to Z_BUF_ERROR, canary untouched. */
+    paint(alt, 64);
+    r = s.deflate(alt, n - 1);
+    want("Text/deflate/one-short-cap", r, Z_BUF_ERROR);
+    truth("Text/deflate/one-short-canary", canary(alt, n - 1, 64));
+
+    /* Inflate into exactly the original length. */
+    in = packed;
+    paint(back, 64);
+    r = in.inflate(n, back, 17);
+    want("Text/inflate/exact-cap", r, 17);
+    truth("Text/inflate/exact-bytes",
+          r == 17 && memcmp(back, s, (size_t)17) == 0);
+
+    /* One byte short. */
+    paint(back, 64);
+    r = in.inflate(n, back, 16);
+    want("Text/inflate/one-short-cap", r, Z_BUF_ERROR);
+    truth("Text/inflate/one-short-canary", canary(back, 16, 64));
+
+    /* Truncated input: no stream end, mapped to Z_BUF_ERROR. */
+    paint(back, 64);
+    r = in.inflate(n - 1, back, 64);
+    want("Text/inflate/truncated", r, Z_BUF_ERROR);
+
+    /* Corrupt header byte: Z_DATA_ERROR, nothing written past the cap. */
+    memcpy(corrupt, packed, (size_t)n);
+    corrupt[0] = (char)((unsigned char)corrupt[0] ^ 0xff);
+    in = corrupt;
+    paint(back, 64);
+    r = in.inflate(n, back, 32);
+    want("Text/inflate/corrupt", r, Z_DATA_ERROR);
+    truth("Text/inflate/corrupt-canary", canary(back, 32, 64));
+
+    /* Zero-capacity output cannot hold even the empty stream. */
+    paint(alt, 64);
+    r = s.deflate(alt, 0);
+    want("Text/deflate/cap-zero", r, Z_BUF_ERROR);
+    truth("Text/deflate/cap-zero-canary", canary(alt, 0, 64));
+}
+
+static void test_text_bounds(void)
+{
+    char alt[64];
+    char *s;
+    char *bigp;
+    int bound;
+    int r;
+
+    s = "";
+    bound = s.deflateBound();
+    truth("Text/deflateBound/empty-positive", bound > 0);
+    r = s.deflate(alt, bound);
+    truth("Text/deflateBound/empty-sufficient", r >= 0 && r <= bound);
+
+    s = "hello hello hello";
+    bound = s.deflateBound();
+    r = s.deflate(alt, bound);
+    truth("Text/deflateBound/text-sufficient", r >= 0 && r <= bound);
+
+    /* The large case passes the bound itself as the capacity. */
+    bigp = big_text;
+    bound = bigp.deflateBound();
+    r = bigp.deflate(big_packed, bound);
+    truth("Text/deflateBound/large-sufficient", r >= 0 && r <= bound);
+
+    /* A null text pointer is rejected before strlen. */
+    s = 0;
+    r = s.deflateBound();
+    want("Text/deflateBound/null-receiver", r, Z_STREAM_ERROR);
+}
+
+/* -------------------------------------------------------------- Buffer --- */
+
+static void test_buffer_basic(void)
+{
+    z_stream zs;
+    z_stream *zp;
+    char packed[128];
+    char back[128];
+    char *s;
+    int n;
+    int r;
+
+    zp = &zs;
+
+    /* Empty input, both directions. */
+    memset(&zs, 0, sizeof(zs));
+    want("Buffer/deflateInit/ok", zp->deflateInit(6), Z_OK);
+    paint(packed, 128);
+    r = zp->deflateBuffer("", 0, packed, 128, Z_FINISH);
+    want("Buffer/deflate/empty-end", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    want("Buffer/deflateEnd/ok", zp->deflateEnd(), Z_OK);
+
+    memset(&zs, 0, sizeof(zs));
+    want("Buffer/inflateInit/ok", zp->inflateInit(), Z_OK);
+    paint(back, 128);
+    r = zp->inflateBuffer(packed, n, back, 128, Z_FINISH);
+    want("Buffer/inflate/empty-end", r, Z_STREAM_END);
+    want("Buffer/inflate/empty-length", (int)zs.total_out, 0);
+    want("Buffer/inflateEnd/ok", zp->inflateEnd(), Z_OK);
+
+    /* One byte. */
+    s = "a";
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(packed, 128);
+    r = zp->deflateBuffer(s, 1, packed, 128, Z_FINISH);
+    want("Buffer/deflate/single-end", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    zp->deflateEnd();
+
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(back, 128);
+    r = zp->inflateBuffer(packed, n, back, 128, Z_FINISH);
+    want("Buffer/inflate/single-end", r, Z_STREAM_END);
+    truth("Buffer/inflate/single-bytes",
+          (int)zs.total_out == 1 && back[0] == 'a');
+    zp->inflateEnd();
+}
+
+static void test_buffer_binary(void)
+{
+    z_stream zs;
+    z_stream *zp;
+    unsigned int seed;
+    int i;
+    int n;
+    int r;
+
+    zp = &zs;
+
+    /* 256 bytes 0x00..0xFF: the first byte is a NUL. */
+    for (i = 0; i < 256; i++) bin[i] = (char)i;
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(&bin_packed[0], BIG + 200);
+    r = zp->deflateBuffer(bin, 256, bin_packed, BIG + 200, Z_FINISH);
+    want("Buffer/deflate/nul256-end", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    zp->deflateEnd();
+
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(&bin_back[0], BIG);
+    r = zp->inflateBuffer(bin_packed, n, bin_back, BIG, Z_FINISH);
+    want("Buffer/inflate/nul256-end", r, Z_STREAM_END);
+    want("Buffer/roundtrip/nul256-length", (int)zs.total_out, 256);
+    truth("Buffer/roundtrip/nul256-bytes",
+          memcmp(bin_back, bin, (size_t)256) == 0);
+    zp->inflateEnd();
+
+    /* > 64 KB, NULs included, byte-exact. */
+    for (i = 0; i < BIG; i++) {
+        bin[i] = (char)((i * 131 + (i >> 3)) & 0xff);
+    }
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(&bin_packed[0], BIG + 200);
+    r = zp->deflateBuffer(bin, BIG, bin_packed, BIG + 200, Z_FINISH);
+    want("Buffer/deflate/large-end", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    zp->deflateEnd();
+
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(&bin_back[0], BIG);
+    r = zp->inflateBuffer(bin_packed, n, bin_back, BIG, Z_FINISH);
+    want("Buffer/inflate/large-end", r, Z_STREAM_END);
+    want("Buffer/roundtrip/large-length", (int)zs.total_out, BIG);
+    truth("Buffer/roundtrip/large-bytes",
+          memcmp(bin_back, bin, (size_t)BIG) == 0);
+    zp->inflateEnd();
+
+    /* Incompressible bytes: output grows, but the round trip stays exact. */
+    seed = 1;
+    for (i = 0; i < 4096; i++) {
+        seed = seed * 1103515245u + 12345u;
+        rnd[i] = (char)((seed >> 16) & 0xff);
+    }
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(&rnd_packed[0], 8192);
+    r = zp->deflateBuffer(rnd, 4096, rnd_packed, 8192, Z_FINISH);
+    want("Buffer/deflate/incompressible-end", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    truth("Buffer/deflate/incompressible-expands", n > 4096);
+    zp->deflateEnd();
+
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(&rnd_back[0], 4096);
+    r = zp->inflateBuffer(rnd_packed, n, rnd_back, 4096, Z_FINISH);
+    want("Buffer/inflate/incompressible-end", r, Z_STREAM_END);
+    want("Buffer/roundtrip/incompressible-length", (int)zs.total_out, 4096);
+    truth("Buffer/roundtrip/incompressible-bytes",
+          memcmp(rnd_back, rnd, (size_t)4096) == 0);
+    zp->inflateEnd();
+}
+
+static void test_buffer_edges(void)
+{
+    z_stream zs;
+    z_stream *zp;
+    char packed[128];
+    char alt[128];
+    char back[64];
+    char corrupt[64];
+    char *s;
+    int n;
+    int r;
+
+    zp = &zs;
+    s = "hello hello hello";
+
+    /* Learn the compressed size with a generous cap. */
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(packed, 128);
+    r = zp->deflateBuffer(s, 17, packed, 128, Z_FINISH);
+    want("Buffer/deflate/known-end", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    zp->deflateEnd();
+
+    /* Exact cap. */
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(alt, 128);
+    r = zp->deflateBuffer(s, 17, alt, n, Z_FINISH);
+    want("Buffer/deflate/exact-cap", r, Z_STREAM_END);
+    want("Buffer/deflate/exact-length", (int)zs.total_out, n);
+    zp->deflateEnd();
+
+    /* One byte short. */
+    memset(&zs, 0, sizeof(zs));
+    zp->deflateInit(6);
+    paint(alt, 128);
+    r = zp->deflateBuffer(s, 17, alt, n - 1, Z_FINISH);
+    truth("Buffer/deflate/one-short", r != Z_STREAM_END && r >= 0);
+    truth("Buffer/deflate/one-short-canary", canary(alt, n - 1, 128));
+    zp->deflateEnd();
+
+    /* Inflate exact cap. */
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(back, 64);
+    r = zp->inflateBuffer(packed, n, back, 17, Z_FINISH);
+    want("Buffer/inflate/exact-cap", r, Z_STREAM_END);
+    want("Buffer/inflate/exact-length", (int)zs.total_out, 17);
+    zp->inflateEnd();
+
+    /* Inflate one byte short. */
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(back, 64);
+    r = zp->inflateBuffer(packed, n, back, 16, Z_FINISH);
+    truth("Buffer/inflate/one-short",
+          r != Z_STREAM_END && (r == Z_OK || r == Z_BUF_ERROR));
+    want("Buffer/inflate/one-short-length", (int)zs.total_out, 16);
+    truth("Buffer/inflate/one-short-canary", canary(back, 16, 64));
+    zp->inflateEnd();
+
+    /* Corrupt header: Z_DATA_ERROR, canary intact. */
+    memcpy(corrupt, packed, (size_t)n);
+    corrupt[0] = (char)((unsigned char)corrupt[0] ^ 0xff);
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(back, 64);
+    r = zp->inflateBuffer(corrupt, n, back, 32, Z_FINISH);
+    want("Buffer/inflate/corrupt", r, Z_DATA_ERROR);
+    truth("Buffer/inflate/corrupt-canary", canary(back, 32, 64));
+    zp->inflateEnd();
+
+    /* Truncated input: no stream end, no overrun. */
+    memset(&zs, 0, sizeof(zs));
+    zp->inflateInit();
+    paint(back, 64);
+    r = zp->inflateBuffer(packed, n - 1, back, 17, Z_FINISH);
+    truth("Buffer/inflate/truncated",
+          r == Z_OK || r == Z_BUF_ERROR);
+    truth("Buffer/inflate/truncated-canary", canary(back, 17, 64));
+    zp->inflateEnd();
+
+    /* Argument validation happens before the buffer fields are installed. */
+    memset(&zs, 0, sizeof(zs));
+    want("Buffer/param/negative-inlen",
+         zp->deflateBuffer(s, -1, packed, 8, Z_FINISH), Z_STREAM_ERROR);
+    want("Buffer/param/negative-outcap",
+         zp->deflateBuffer(s, 1, packed, -1, Z_FINISH), Z_STREAM_ERROR);
+    want("Buffer/param/null-in",
+         zp->deflateBuffer(0, 1, packed, 8, Z_FINISH), Z_STREAM_ERROR);
+    want("Buffer/param/null-out",
+         zp->deflateBuffer(s, 1, 0, 8, Z_FINISH), Z_STREAM_ERROR);
+    want("Buffer/param/negative-inlen-inflate",
+         zp->inflateBuffer(s, -1, packed, 8, Z_FINISH), Z_STREAM_ERROR);
+
+    zp = 0;
+    want("Buffer/param/null-strm",
+         zp->deflateBuffer(s, 1, packed, 8, Z_FINISH), Z_STREAM_ERROR);
+    want("Buffer/param/null-strm-inflate",
+         zp->inflateBuffer(s, 1, packed, 8, Z_FINISH), Z_STREAM_ERROR);
+}
+
+/* --------------------------------------------------------- state machine --- */
+
+static void test_stream(void)
+{
+    z_stream zs;
+    z_stream *zp;
+    char packed[64];
+    char back[32];
+    char *s;
+    int n;
+    int r;
+
+    s = "hello hello hello";
+    zp = &zs;
+
+    /* deflateInit -> deflate -> deflateEnd, then a repeated end. */
+    memset(&zs, 0, sizeof(zs));
+    want("Stream/deflateInit", zp->deflateInit(6), Z_OK);
+    zp->next_in = (unsigned char *)s;
+    zp->avail_in = 17;
+    zp->next_out = (unsigned char *)packed;
+    zp->avail_out = 64;
+    r = zp->deflate(Z_FINISH);
+    want("Stream/deflate-finish", r, Z_STREAM_END);
+    n = (int)zs.total_out;
+    truth("Stream/deflate-bytes", n > 0 && n <= 64);
+    want("Stream/deflateEnd", zp->deflateEnd(), Z_OK);
+    want("Stream/deflateEnd-twice", zp->deflateEnd(), Z_STREAM_ERROR);
+
+    /* inflateInit -> inflate -> inflateEnd, then a repeated end. */
+    memset(&zs, 0, sizeof(zs));
+    want("Stream/inflateInit", zp->inflateInit(), Z_OK);
+    zp->next_in = (unsigned char *)packed;
+    zp->avail_in = (unsigned int)n;
+    zp->next_out = (unsigned char *)back;
+    zp->avail_out = 32;
+    r = zp->inflate(Z_FINISH);
+    want("Stream/inflate-finish", r, Z_STREAM_END);
+    want("Stream/inflate-length", (int)zs.total_out, 17);
+    truth("Stream/inflate-bytes",
+          memcmp(back, s, (size_t)17) == 0);
+    want("Stream/inflateEnd", zp->inflateEnd(), Z_OK);
+    want("Stream/inflateEnd-twice", zp->inflateEnd(), Z_STREAM_ERROR);
+
+    /* Codec methods on a zeroed (uninitialised) stream. */
+    memset(&zs, 0, sizeof(zs));
+    want("Stream/deflate-before-init", zp->deflate(Z_FINISH), Z_STREAM_ERROR);
+    want("Stream/inflate-before-init", zp->inflate(Z_FINISH), Z_STREAM_ERROR);
+}
+
+int main(void)
+{
+    printf("== zlib unit tests ==\n");
+    test_text_basic();
+    test_text_edges();
+    test_text_bounds();
+    test_buffer_basic();
+    test_buffer_binary();
+    test_buffer_edges();
+    test_stream();
+    printf("SUMMARY pass=%d fail=%d\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}

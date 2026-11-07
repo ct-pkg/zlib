@@ -1,0 +1,114 @@
+/*
+ * demo.ct - the three paths of the package on one fixed input.
+ *
+ * 1. `z_stream *` host: raw deflateInit / deflate / deflateEnd, counters set
+ *    by hand.
+ * 2. `char *` host: one-shot text `deflate` / `inflate` / `deflateBound`.
+ * 3. `z_stream *` host: `deflateBuffer` / `inflateBuffer`, which install the
+ *    four buffer fields before the single call.
+ *
+ * One-shot: every call gets a buffer large enough for the whole result and
+ * uses Z_FINISH. The input is 17 bytes ("hello hello hello"), which deflates
+ * to 16 bytes on the zlib builds this package was tested with; the demo
+ * asserts the round trip, not the compressed size.
+ *
+ * `v0.19.1` does not accept a literal method receiver, so the text is held in
+ * a `char *` variable before `text.deflate(...)`.
+ *
+ * License: Zlib (see LICENSE).
+ */
+#include <stdio.h>
+#include <string.h>
+#include <zlib.h>
+
+import zlib::zlib;
+
+int main(void)
+{
+    z_stream zs;
+    z_stream *zp;
+    char packed[64];
+    char back[64];
+    char *text;
+    char *in;
+    int packed_len;
+    int out_len;
+    int r;
+    int same;
+
+    text = "hello hello hello";
+
+    /* 1. Raw state machine. */
+    memset(&zs, 0, sizeof(zs));
+    zp = &zs;
+
+    r = zp->deflateInit(6);
+    if (r != Z_OK) { printf("deflate_init=%d\n", r); return 1; }
+    zp->next_in = (unsigned char *)text;
+    zp->avail_in = 17;
+    zp->next_out = (unsigned char *)packed;
+    zp->avail_out = 64;
+    r = zp->deflate(Z_FINISH);
+    printf("in=17\n");
+    printf("deflate=%d\n", r);
+    packed_len = (int)zs.total_out;
+    printf("packed=%d\n", packed_len);
+    printf("deflate_end=%d\n", zp->deflateEnd());
+
+    memset(&zs, 0, sizeof(zs));
+    r = zp->inflateInit();
+    if (r != Z_OK) { printf("inflate_init=%d\n", r); return 1; }
+    zp->next_in = (unsigned char *)packed;
+    zp->avail_in = (unsigned int)packed_len;
+    zp->next_out = (unsigned char *)back;
+    zp->avail_out = 64;
+    r = zp->inflate(Z_FINISH);
+    printf("inflate=%d\n", r);
+    out_len = (int)zs.total_out;
+    printf("out=%d\n", out_len);
+    zp->inflateEnd();
+
+    back[out_len] = 0;
+    same = strcmp(back, text) == 0;
+    printf("roundtrip=%s\n", same ? "ok" : "bad");
+    if (!same) return 1;
+
+    /* 2. Text host: the same round trip in two calls. */
+    r = text.deflate(packed, 64);
+    printf("text_deflate=%d\n", r);
+    if (r < 0) return 1;
+    packed_len = r;
+    printf("text_bound_ok=%d\n", text.deflateBound() >= packed_len);
+
+    in = packed;
+    out_len = in.inflate(packed_len, back, 64);
+    printf("text_inflate=%d\n", out_len);
+    if (out_len < 0) return 1;
+    back[out_len] = 0;
+    same = strcmp(back, text) == 0;
+    printf("text_roundtrip=%s\n", same ? "ok" : "bad");
+    if (!same) return 1;
+
+    /* 3. Buffer helpers on the state machine. */
+    memset(&zs, 0, sizeof(zs));
+    r = zp->deflateInit(6);
+    if (r != Z_OK) { printf("deflate_init=%d\n", r); return 1; }
+    r = zp->deflateBuffer(text, 17, packed, 64, Z_FINISH);
+    printf("buffer_deflate=%d\n", r);
+    packed_len = (int)zs.total_out;
+    zp->deflateEnd();
+
+    memset(&zs, 0, sizeof(zs));
+    r = zp->inflateInit();
+    if (r != Z_OK) { printf("inflate_init=%d\n", r); return 1; }
+    r = zp->inflateBuffer(packed, packed_len, back, 64, Z_FINISH);
+    printf("buffer_inflate=%d\n", r);
+    out_len = (int)zs.total_out;
+    zp->inflateEnd();
+    printf("buffer_out=%d\n", out_len);
+
+    back[out_len] = 0;
+    same = strcmp(back, text) == 0;
+    printf("buffer_roundtrip=%s\n", same ? "ok" : "bad");
+    return same ? 0 : 1;
+}
