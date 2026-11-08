@@ -624,7 +624,35 @@ zlib.m.ct:10:91: error: map recipe names 'z_stream' but it is not a binding para
 recipe 的 `sizeof` 只接受绑定参数，`sizeof z` 得到指针大小（8）而不是结构体大小。
 宏初始化必须走 `zlib.shim.h` 的 `ct_zlib_deflate_init` / `ct_zlib_inflate_init`。
 
-## 8. 限制与未支持
+## 8. 术语表（Glossary）
+
+术语按三类收录：本包特有概念、全仓易混概念、正文出现过但未解释的英文术语。
+类型名、方法名、文件名与源码逐字一致。
+
+| 术语 | 含义 | 本包中的所指 |
+| --- | --- | --- |
+| `z_stream` | zlib 的压缩/解压流状态结构体，保存算法状态与 `next_in` / `avail_in` / `next_out` / `avail_out` / `total_in` / `total_out`。 | `Init` / `Codec` / `Buffer` 三个 trait 的宿主 `z_stream *`；使用前由调用者 `memset` 清零并自行赋值缓冲字段。 |
+| `deflate` / `inflate` | zlib 的压缩与解压函数名，也是本包在两个宿主上共用的方法名。 | `z_stream *` 上是一次状态机推进（接收 `flush`）；`char *` 上是对整段文本一次压/解。 |
+| `deflateBuffer` / `inflateBuffer` | 一次调用完成「写入四个缓冲字段 + 跑一步 `deflate` / `inflate`」的便捷方法，复用同一台流。 | `Buffer` trait 的两个方法，宿主是 `z_stream *`；实现在 `zlib/zlib.shim.h` 的 `ct_zlib_deflate_buffer` / `ct_zlib_inflate_buffer`。 |
+| `flush` | 告诉 zlib 这一轮输入是否结束的参数，决定是否强制输出、是否收尾。 | `deflate` / `inflate` / `deflateBuffer` / `inflateBuffer` 的 `int flush` 参数，原样透传。 |
+| `Z_NO_FLUSH` | 输入尚未结束，允许 zlib 暂不输出。 | 分块喂入的中间块用它（配方 1）；返回 `Z_OK` 且 `avail_out` 有剩余是正常结果。 |
+| `Z_FINISH` | 输入已结束，要求本轮完成收尾。 | 一次性压缩/解压用它；成功返回 `Z_STREAM_END`（`1`）。 |
+| `Z_SYNC_FLUSH` | 把已压缩数据全部写出并做字节对齐，之后仍可继续写。 | 本包不做特殊处理，只是把常量透传给 `deflate` / `inflate`。 |
+| `gzip` | 一种带文件头与 CRC 的压缩容器格式，是 zlib 的另一种外层包装。 | 本包不支持：没有映射 `deflateInit2`，`deflateInit` 走默认的 zlib 包装。 |
+| `windowBits` | `deflateInit2` 的参数，同时决定窗口大小与最外层包装（zlib 或 gzip）。 | 本包没有映射 `deflateInit2`，因此 `windowBits` 不可调，gzip 模式也不可用。 |
+| 压缩级别（compression level） | `deflateInit(level)` 的整数参数：`0` 不压缩、`1` 最快、`9` 最小，`Z_DEFAULT_COMPRESSION`（`-1`）为默认。 | `deflateInit(level)` 原样接收；`char *` 宿主的 `deflate` 固定使用 `Z_DEFAULT_COMPRESSION`。 |
+| `deflateBound` | 估算一段输入压缩后的最坏输出长度，用来给输出缓冲兜底。 | `Text` trait 的方法，宿主 `char *`，返回 `compressBound(strlen(s))`；参数非法返回 `Z_STREAM_ERROR`（`-2`）。 |
+| `Text` | 面向整段文本的一次性接口：不必自己调用 `deflateInit` / `deflateEnd` 或 `inflateInit` / `inflateEnd`，也不读计数。 | 宿主 `char *`，方法 `deflate` / `inflate` / `deflateBound`；内部建临时 `z_stream`，输入长度取 `strlen`，只适合不含 NUL 的文本。 |
+| `Buffer` | 面向「调用方已持有 `z_stream`」的一次性缓冲接口。 | 宿主 `z_stream *`，方法 `deflateBuffer` / `inflateBuffer`；与 `Text` 并存的理由是要支持二进制、复用调用方的流并读 `total_in` / `total_out`。 |
+| 句柄（handle） | 一个不透明指针，调用方只通过方法操作它，不直接碰内部结构。 | 本包不引入包装类型：`z_stream *` 就是调用方自己声明的 `z_stream`，`char *` 就是文本缓冲区本身。 |
+| 宿主（host） | trait 方法挂靠的类型。 | 两个宿主：`z_stream *`（`Init` / `Codec` / `Buffer`）和 `char *`（`Text`）。 |
+| 映射（map trait） | 把 trait 方法绑定到宿主并转调 C 函数的声明。 | `zlib/zlib.m.ct` 里的四段 `map trait … for type …`，每行转调一个 `ct_zlib_*` 函数或直接调 zlib。 |
+| recipe | `map trait` 里把一个方法绑定到一次 C 调用的那一行写法。 | §9 的排错说明：recipe 的 `sizeof` 只接受绑定参数，`sizeof z` 得到指针大小，所以 `deflateInit` / `inflateInit` 走 `zlib/zlib.shim.h` 的 `ct_zlib_deflate_init` / `ct_zlib_inflate_init`。 |
+| 链式返回自身（return receiver） | 方法返回接收者本身，使下一次调用可以接在后面。 | 本包不提供：方法返回 zlib 状态码或字节数，多轮推进要自己按 `avail_in` / `avail_out` 移动指针。 |
+| 所有权（ownership） | 谁负责释放一块内存的约定。 | 本包不分配缓冲：`next_in` / `next_out` 归调用方；`z_stream` 内部状态归 zlib，由 `deflateEnd` / `inflateEnd` 释放。 |
+| 借用（borrow） | 只取得指针的使用权，不承担释放责任。 | 压/解方法只借用调用方传入的输入输出缓冲，返回后调用方即可复用。 |
+
+## 9. 限制与未支持
 
 1. **`char *` 宿主的输入按 `strlen` 计长。** 含 NUL 的二进制必须用 `z_stream *`。
 2. **`inflate` 必须显式给 `inLen`。** 压缩数据是二进制，不能 `strlen`。
@@ -650,7 +678,7 @@ recipe 的 `sizeof` 只接受绑定参数，`sizeof z` 得到指针大小（8）
   与本包无关，但不要再新增同名方法。
 - 本包自己的 C helper 全部带 `ct_zlib_` 前缀，避免与 zlib 的全局符号重名。
 
-## 9. 版本与变更记录
+## 10. 版本与变更记录
 
 当前版本 `0.1.0`，未打 tag、未写入 `ct-pkg/index`。许可：上游 zlib 为 Zlib 许可证，
 包内 `.ct` 代码为 MIT，全文见 [LICENSE](LICENSE)。
